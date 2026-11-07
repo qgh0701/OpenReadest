@@ -383,7 +383,12 @@ export const syncWebDavSelection = async (
   },
   callbacks?: SyncCallbacks,
   control?: SyncControl,
-): Promise<{ conflicts: WebDavConflictItem[]; failures: WebDavSyncLogItem[] }> => {
+): Promise<{
+  conflicts: WebDavConflictItem[];
+  failures: WebDavSyncLogItem[];
+  /** 本次同步成功下载/合并到本地的 config.json 条目键（见 appliedConfigKeys 收集处） */
+  appliedConfigKeys: string[];
+}> => {
   const client = new WebDavClient({
     serverUrl: profile.serverUrl,
     rootPath: profile.remotePath,
@@ -461,6 +466,11 @@ export const syncWebDavSelection = async (
 
   const conflicts: WebDavConflictItem[] = [];
   const failures: WebDavSyncLogItem[] = [];
+  // 本次同步中成功下载/合并到本地的 config.json 条目键（'Books/<hash>/x.json'）。
+  // 引擎只负责把远端进度写到磁盘；磁盘与应用内存之间需要上层胶水把新进度
+  // 应用到已打开的阅读视图（见 applyDownloadedBookConfigs），否则远端进度
+  // 下载后书不跳转，且随后的本地自动保存会用内存旧进度反向覆盖刚下载的文件。
+  const appliedConfigKeys: string[] = [];
   const log = (
     direction: 'upload' | 'download',
     path: string,
@@ -956,6 +966,9 @@ export const syncWebDavSelection = async (
           stateDirty = true;
         }
       }
+      if (!operationFailed && item.key.toLowerCase().endsWith('/config.json')) {
+        appliedConfigKeys.push(item.key);
+      }
     } else if (
       !options.dryRun &&
       !deletionHandled &&
@@ -1022,7 +1035,7 @@ export const syncWebDavSelection = async (
     }
   }
 
-  return { conflicts, failures };
+  return { conflicts, failures, appliedConfigKeys };
 };
 
 const isJsonPath = (path: string): boolean => {

@@ -22,6 +22,7 @@ import { eventDispatcher } from '@/utils/event';
 import { WebDavClient } from '@/services/webdav/client/WebDavClient';
 import { requireWebDavSuccess } from '@/services/webdav/response';
 import { resolveWebDavConflicts, syncWebDavSelection } from '@/services/webdav/sync/engine';
+import { applyDownloadedBookConfigs } from '@/services/webdav/sync/applyRemoteConfigs';
 import { computeLocalFingerprint } from '@/services/webdav/sync/fingerprint';
 import {
   mergeWebDavConflictLists,
@@ -570,7 +571,7 @@ export const WebDavCenterWindow = () => {
         await upsertRemoteLibraryIndex(client, pickBooks);
       }
 
-      const { conflicts, failures } = await syncWebDavSelection(
+      const { failures, conflicts, appliedConfigKeys } = await syncWebDavSelection(
         appService,
         profile,
         {
@@ -611,6 +612,16 @@ export const WebDavCenterWindow = () => {
           await addDownloadedBooksToShelf(pickBooks);
         }
         await loadRemoteBooks(client);
+      }
+
+      // 引擎已把远端 config.json 落盘：应用到内存与打开中的阅读视图（与
+      // Runner 相同的胶水；手动同步常发生在"换设备接力"场景，立即跳转）。
+      if (appliedConfigKeys.length > 0) {
+        try {
+          await applyDownloadedBookConfigs(appService, appliedConfigKeys);
+        } catch {
+          // 胶水失败不影响同步结果
+        }
       }
 
       // 同步可能已合并/下载远端墓碑改写本地 library.json：无论本轮成败，
@@ -669,6 +680,15 @@ export const WebDavCenterWindow = () => {
         const result = results[0];
         if (result?.ok) {
           removeConflict(conflict.profileId, conflict.path);
+          // 保留远端即下载了远端 config.json：立即应用到打开中的阅读视图，
+          // 避免本地自动保存用内存旧进度覆盖刚收敛的内容。
+          if (keep === 'remote' && conflict.path.toLowerCase().endsWith('/config.json')) {
+            try {
+              await applyDownloadedBookConfigs(appService, [conflict.path]);
+            } catch {
+              // 胶水失败不影响冲突收敛结果
+            }
+          }
           showToast(_('冲突已解决'), 'success');
         } else {
           showToast(

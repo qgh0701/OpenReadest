@@ -6,6 +6,7 @@ import { useTranslation } from '@/hooks/useTranslation';
 import { useLibraryStore } from '@/store/libraryStore';
 import { useWebDavStore } from '@/store/webdavStore';
 import { syncWebDavSelection } from '@/services/webdav/sync/engine';
+import { applyDownloadedBookConfigs } from '@/services/webdav/sync/applyRemoteConfigs';
 import { computeLocalFingerprint } from '@/services/webdav/sync/fingerprint';
 import { mergeWebDavConflictLists } from '@/services/webdav/sync/conflicts';
 import { getLocalLibraryPath } from '@/services/webdav/sync/paths';
@@ -72,7 +73,7 @@ const WebDavAutoSyncRunner = () => {
       if (useWebDavStore.getState().isSyncing) return;
       useWebDavStore.getState().setSyncing(true);
       try {
-        const { failures, conflicts } = await syncWebDavSelection(
+        const { failures, conflicts, appliedConfigKeys } = await syncWebDavSelection(
           appService,
           profile,
           {
@@ -114,6 +115,16 @@ const WebDavAutoSyncRunner = () => {
             .setConflicts(
               useWebDavStore.getState().conflicts.filter((c) => c.profileId !== profile.id),
             );
+        }
+
+        // 引擎已把远端 config.json 落盘：立即应用到内存与打开中的阅读视图，
+        // 否则打开中的书不跳转，且本地自动保存会用内存旧进度覆盖刚下载的文件。
+        if (appliedConfigKeys.length > 0) {
+          try {
+            await applyDownloadedBookConfigs(appService, appliedConfigKeys);
+          } catch {
+            // 胶水失败不影响同步结果；磁盘进度已是最新，下次打开自然生效
+          }
         }
 
         // 同步可能改写本地 library.json（合并或下载远端墓碑）：即使本轮存在

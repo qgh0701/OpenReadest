@@ -156,7 +156,24 @@ const mergeBookConfig = (local: unknown, remote: unknown): JsonRecord | null => 
   const localNotes = indexUniqueRecords('booknotes' in local ? local['booknotes'] : [], 'id');
   const remoteNotes = indexUniqueRecords('booknotes' in remote ? remote['booknotes'] : [], 'id');
   if (!localNotes || !remoteNotes) return null;
-  if (localNotes.size === 0 && remoteNotes.size === 0) return null;
+
+  if (localNotes.size === 0 && remoteNotes.size === 0) {
+    // 无批注书籍（两侧 booknotes 均为空或缺失）此前直接返回 null，导致进度
+    // 等标量字段永远无法内容合并，只能落入单边覆盖或手动冲突——纯阅读的
+    // 书（大多数场景）进度同步由此反复互踩。改为：标量字段按 updatedAt 取
+    // 新方，booknotes 合并为空数组，使这类书也能走内容合并路径。
+    const winner = pickRecord(local, remote, ['updatedAt'], withoutBooknotes);
+    const loser = winner === local ? remote : local;
+    const merged: JsonRecord = { ...winner };
+    for (const identityKey of ['bookHash', 'metaHash']) {
+      if (!getOptionalId(merged, identityKey)) {
+        const fallback = getOptionalId(loser, identityKey);
+        if (fallback) merged[identityKey] = fallback;
+      }
+    }
+    merged['booknotes'] = [];
+    return merged;
+  }
 
   const winner = pickRecord(local, remote, ['updatedAt'], withoutBooknotes);
   const loser = winner === local ? remote : local;
