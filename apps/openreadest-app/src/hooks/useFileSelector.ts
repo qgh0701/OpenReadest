@@ -144,6 +144,11 @@ export const FILE_SELECTION_PRESETS = {
     extensions: ['ifo', 'idx', 'dict', 'dz', 'syn', 'mdx', 'mdd', 'slob', 'index'],
     dialogTitle: _('Select Dictionary Files'),
   },
+  wordlists: {
+    accept: '.txt,.csv,.tsv,.json',
+    extensions: ['txt', 'csv', 'tsv', 'json'],
+    dialogTitle: _('Select Wordlist Files'),
+  },
   covers: {
     accept: '.png, .jpg, .jpeg, .gif',
     extensions: ['png', 'jpg', 'jpeg', 'gif'],

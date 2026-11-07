@@ -10,6 +10,9 @@ import {
   MdPlayArrow,
   MdPause,
   MdDelete,
+  MdSync,
+  MdCheckCircle,
+  MdBuild,
 } from 'react-icons/md';
 import { useEnv } from '@/context/EnvContext';
 import { useTranslation } from '@/hooks/useTranslation';
@@ -48,6 +51,9 @@ import {
 } from '@/services/webdav/profileName';
 import { Book, BookFormat } from '@/types/book';
 import { EXTS } from '@/libs/document';
+import { verifyWebDavSync, VerifyReport } from '@/services/webdav/sync/verify';
+import { repairRemoteStatistics, STATISTICS_SYNC_KEY } from '@/services/statistics/statisticsSync';
+import { StatisticsDb } from '@/services/statistics/statisticsDb';
 
 export const setWebDavCenterVisible = (visible: boolean) => {
   const dialog = document.getElementById('webdav_center');
@@ -138,6 +144,13 @@ export const WebDavCenterWindow = () => {
   const [conflictDetails, setConflictDetails] = useState<
     Record<string, WebDavJsonDiffSummary | null>
   >({});
+  // 「立刻同步」/「同步验证」的独立状态。验证是只读检查，刻意不复用
+  // isSyncing——那会与自动同步互斥，也会让「验证」看起来像在跑全量同步。
+  const [isQuickSyncing, setIsQuickSyncing] = useState(false);
+  const [isVerifying, setIsVerifying] = useState(false);
+  const [isRepairing, setIsRepairing] = useState(false);
+  const [verifyReport, setVerifyReport] = useState<VerifyReport | null>(null);
+  const [showVerifyDetails, setShowVerifyDetails] = useState(true);
 
   useEffect(() => {
     const handleCustomEvent = (event: CustomEvent) => {
@@ -592,7 +605,8 @@ export const WebDavCenterWindow = () => {
 
       // 已被取消/关闭窗口：部分同步结果不算成功，不提示、不记 lastSuccessAt
       if (cancelRef.current) return;
-      if (failures.length > 0) {
+      const hardFailures = failures.filter((f) => f.path !== STATISTICS_SYNC_KEY);
+      if (hardFailures.length > 0) {
         showToast(_('同步失败'), 'error');
         setActiveTab('logs');
       } else if (conflicts.length > 0) {
@@ -632,6 +646,152 @@ export const WebDavCenterWindow = () => {
     } finally {
       setSyncing(false);
       setPaused(false);
+    }
+  };
+
+  const buildWebDavClient = (profile: WebDavProfile) =>
+    new WebDavClient({
+      serverUrl: profile.serverUrl,
+      rootPath: profile.remotePath,
+      username: profile.username,
+      password: profile.password,
+      allowInsecureHttp: profile.allowInsecureHttp,
+      allowInsecureTls: profile.allowInsecureTls,
+    });
+
+  /**
+   * 「立刻同步」：不等自动同步周期，一键跑全库同步（书库索引 + 全部书籍 +
+   * 封面 + config.json + 阅读统计），完成后把下载的进度应用到已打开的书，
+   * 并自动做一次只读验证，把结果直接摆出来。
+   */
+  const startQuickSync = async () => {
+    if (!appService) return;
+    if (useWebDavStore.getState().isSyncing || isQuickSyncing) return;
+    const profile = buildValidatedProfile();
+    if (!profile) return;
+    upsertProfile(profile);
+    setEditing(profile);
+    const allBooks = useLibraryStore.getState().library;
+    if (allBooks.length === 0) {
+      showToast(_('书库为空，没有可同步的内容'), 'warning');
+      return;
+    }
+    setIsQuickSyncing(true);
+    cancelRef.current = false;
+    setPaused(false);
+    setProgress({ totalItems: 0, completedItems: 0 });
+    const libraryMd5Before = await computeLibraryMd5();
+    if (useWebDavStore.getState().isSyncing) {
+      setIsQuickSyncing(false);
+      return;
+    }
+    useWebDavStore.getState().setSyncing(true);
+    try {
+      const { failures, conflicts, appliedConfigKeys } = await syncWebDavSelection(
+        appService,
+        profile,
+        {
+          books: allBooks,
+          includeLibrary: true,
+          includeStatistics: isReadingStatsEnabled(useSettingsStore.getState().settings),
+        },
+        {
+          onProgress: (p) => setProgress(p),
+          onLog: (l) => addLog(l),
+        },
+        { shouldCancel: () => cancelRef.current },
+      );
+      // 统计步骤失败只作独立警告：它不影响书籍与进度同步的成败，也不应
+      // 让整次同步被标成「同步失败」、阻断成功时间记录。
+      const hardFailures = failures.filter((f) => f.path !== STATISTICS_SYNC_KEY);
+      const statFailures = failures.filter((f) => f.path === STATISTICS_SYNC_KEY);
+      if (appliedConfigKeys.length > 0) {
+        try {
+          await applyDownloadedBookConfigs(appService, appliedConfigKeys);
+        } catch {
+          // 胶水失败不影响同步结果
+        }
+      }
+      await reloadLibraryIfDiskChanged(libraryMd5Before);
+      if (statFailures.length > 0) {
+        showToast(_('阅读统计同步失败，可在「同步验证」里查看并修复'), 'warning');
+      }
+      if (hardFailures.length > 0) {
+        showToast(_('同步失败'), 'error');
+        setActiveTab('logs');
+      } else if (conflicts.length > 0) {
+        setConflicts(mergeWebDavConflictLists(useWebDavStore.getState().conflicts, conflicts));
+        showToast(_('检测到 {{count}} 个同步冲突，请处理', { count: conflicts.length }), 'warning');
+        setActiveTab('conflicts');
+      } else {
+        const ts = Date.now();
+        setLastSuccessAt(ts);
+        const updated = { ...profile, lastSyncAt: ts };
+        upsertProfile(updated);
+        setEditing(updated);
+        showToast(_('立刻同步完成'), 'success');
+      }
+      // 同步后自动验证一次，不必再点第二个按钮就能看到两端是否一致
+      try {
+        const report = await verifyWebDavSync(appService, profile, allBooks);
+        setVerifyReport(report);
+        setShowVerifyDetails(false);
+      } catch {
+        // 验证失败不影响同步结果
+      }
+    } catch {
+      showToast(_('同步失败'), 'error');
+    } finally {
+      useWebDavStore.getState().setSyncing(false);
+      setPaused(false);
+      setIsQuickSyncing(false);
+    }
+  };
+
+  const runVerify = async (profileOverride?: WebDavProfile) => {
+    if (!appService || isVerifying) return;
+    const profile = profileOverride ?? buildValidatedProfile();
+    if (!profile) return;
+    setIsVerifying(true);
+    try {
+      const report = await verifyWebDavSync(
+        appService,
+        profile,
+        useLibraryStore.getState().library,
+      );
+      setVerifyReport(report);
+      setShowVerifyDetails(true);
+      const hasError = report.items.some((i) => i.status === 'error');
+      showToast(report.summary, hasError ? 'warning' : 'success');
+      addLog({
+        id: uuidv4(),
+        timestamp: Date.now(),
+        direction: 'download',
+        path: 'verify',
+        status: hasError ? 'failed' : 'completed',
+        message: report.summary,
+      });
+    } catch (error) {
+      showToast(_('同步验证失败：') + ((error as Error).message || ''), 'error');
+    } finally {
+      setIsVerifying(false);
+    }
+  };
+
+  const repairStatistics = async () => {
+    if (!appService || isRepairing) return;
+    const profile = buildValidatedProfile();
+    if (!profile) return;
+    setIsRepairing(true);
+    try {
+      const stats = await StatisticsDb.open(appService);
+      const result = await repairRemoteStatistics(buildWebDavClient(profile), stats);
+      showToast(result.message, result.ok ? 'success' : 'error');
+      if (result.ok) await runVerify(profile);
+    } catch (error) {
+      showToast(_('修复失败：') + ((error as Error).message || ''), 'error');
+    } finally {
+      setIsRepairing(false);
     }
   };
 
@@ -1438,6 +1598,88 @@ export const WebDavCenterWindow = () => {
                 {_('下载选中书籍')}
               </button>
             </div>
+
+            <div className='mt-3 grid grid-cols-2 gap-3'>
+              <button
+                className='btn btn-outline w-full'
+                disabled={isSyncing || isQuickSyncing}
+                onClick={() => void startQuickSync()}
+              >
+                <MdSync size={18} />
+                {_('立刻同步')}
+              </button>
+              <button
+                className='btn btn-outline w-full'
+                disabled={isVerifying}
+                onClick={() => void runVerify()}
+              >
+                <MdCheckCircle size={18} />
+                {_('同步验证')}
+              </button>
+            </div>
+
+            {(isQuickSyncing || isVerifying) && (
+              <div className='text-base-content/60 mt-2 text-xs'>
+                {isQuickSyncing
+                  ? _('正在同步全部书籍、阅读进度与统计数据…')
+                  : _('正在比对本地与云端数据…')}
+              </div>
+            )}
+
+            {verifyReport && (
+              <div className='border-base-300 bg-base-100 mt-3 rounded-lg border p-3'>
+                <div className='flex items-center justify-between gap-2'>
+                  <div className='font-medium'>{_('同步验证结果')}</div>
+                  <div className='flex items-center gap-1'>
+                    <button
+                      className='btn btn-ghost btn-xs'
+                      onClick={() => setShowVerifyDetails(!showVerifyDetails)}
+                    >
+                      {showVerifyDetails ? _('收起明细') : _('展开明细')}
+                    </button>
+                    <button className='btn btn-ghost btn-xs' onClick={() => setVerifyReport(null)}>
+                      {_('关闭')}
+                    </button>
+                  </div>
+                </div>
+                <div className='mt-1 text-sm'>{verifyReport.summary}</div>
+                <div className='text-base-content/50 mt-1 text-xs'>
+                  {new Date(verifyReport.checkedAt).toLocaleString()} · {verifyReport.server}
+                </div>
+                {showVerifyDetails && (
+                  <ul className='border-base-200 mt-2 max-h-64 space-y-1 overflow-y-auto border-t pt-2 text-xs'>
+                    {verifyReport.items.map((item, index) => (
+                      <li key={index} className='flex gap-2'>
+                        <span
+                          className={clsx(
+                            'shrink-0',
+                            item.status === 'ok' && 'text-success',
+                            item.status === 'warn' && 'text-warning',
+                            item.status === 'error' && 'text-error',
+                            item.status === 'info' && 'text-base-content/50',
+                          )}
+                        >
+                          ●
+                        </span>
+                        <span>
+                          <strong>{item.label}</strong>：{item.detail}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                {verifyReport.statisticsBroken && (
+                  <button
+                    className='btn btn-warning btn-sm mt-2 gap-2'
+                    disabled={isRepairing}
+                    onClick={() => void repairStatistics()}
+                  >
+                    <MdBuild size={16} />
+                    {_('修复统计文件（先备份远端）')}
+                  </button>
+                )}
+              </div>
+            )}
 
             <div className='mt-3 flex items-center justify-between'>
               <button className='btn btn-ghost btn-sm' onClick={togglePause} disabled={!isSyncing}>

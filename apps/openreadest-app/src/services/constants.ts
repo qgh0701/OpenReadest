@@ -80,6 +80,7 @@ export const DEFAULT_SYSTEM_SETTINGS: Partial<SystemSettings> = {
   libraryAutoColumns: true,
   libraryColumns: 6,
   customDictionaries: [],
+  customWordlists: [],
 
   kosync: DEFAULT_KOSYNC_SETTINGS,
 

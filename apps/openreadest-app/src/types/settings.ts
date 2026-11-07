@@ -4,6 +4,7 @@ import { CustomTexture } from '@/styles/textures';
 import { HighlightColor, HighlightStyle, ViewSettings } from './book';
 import { OPDSCatalog } from './opds';
 import type { ImportedDictionary } from '@/services/dictionaries/types';
+import type { WordlistDictionary } from '@/services/dictionaries/wordlist';
 
 export type ThemeType = 'light' | 'dark' | 'auto';
 export type LibraryViewModeType = 'grid' | 'list';
@@ -79,6 +80,8 @@ export interface SystemSettings {
   customFonts: CustomFont[];
   customTextures: CustomTexture[];
   customDictionaries: ImportedDictionary[];
+  /** 用户自己整理的简易词表（TXT/CSV/TSV/JSON），供离线词典翻译使用。 */
+  customWordlists?: WordlistDictionary[];
   opdsCatalogs: OPDSCatalog[];
 
   kosync: KOSyncSettings;

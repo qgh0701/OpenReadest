@@ -150,9 +150,11 @@ const mergeBookConfig = (local: unknown, remote: unknown): JsonRecord | null => 
   const remoteBookHash = getOptionalId(remote, 'bookHash');
   if (localBookHash && remoteBookHash && localBookHash !== remoteBookHash) return null;
 
-  const hasBooknotes = 'booknotes' in local || 'booknotes' in remote;
-  if (!hasBooknotes) return null;
-
+  // 纯阅读的书（无批注）生成的 config.json 根本不含 booknotes 字段，只有
+  // updatedAt / viewSettings / searchConfig / progress / location。此前两侧都
+  // 缺该字段时直接 return null，内容合并失败 → manual 策略下记为冲突并跳过
+  // 整个 config.json → 阅读进度永远同步不过来。缺失字段按空数组处理即可
+  // 走下方「按 updatedAt 合并标量」的分支。
   const localNotes = indexUniqueRecords('booknotes' in local ? local['booknotes'] : [], 'id');
   const remoteNotes = indexUniqueRecords('booknotes' in remote ? remote['booknotes'] : [], 'id');
   if (!localNotes || !remoteNotes) return null;

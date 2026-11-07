@@ -12,6 +12,7 @@ import { mergeWebDavConflictLists } from '@/services/webdav/sync/conflicts';
 import { getLocalLibraryPath } from '@/services/webdav/sync/paths';
 import { useSettingsStore } from '@/store/settingsStore';
 import { isReadingStatsEnabled } from '@/services/statistics/remainingTime';
+import { STATISTICS_SYNC_KEY } from '@/services/statistics/statisticsSync';
 import { eventDispatcher } from '@/utils/event';
 
 const shouldRun = () => {
@@ -102,10 +103,14 @@ const WebDavAutoSyncRunner = () => {
             type: 'warning',
           });
         }
-        if (failures.length > 0) {
+        // 阅读统计是独立步骤：它失败不应把书籍/进度同步判成整体失败，也不该
+        // 阻断 lastSuccessAt（否则自动同步会每个周期都从头重试全库）。统计
+        // 的具体错误仍写在同步日志里，可在「同步验证」中查看并修复。
+        const hardFailures = failures.filter((f) => f.path !== STATISTICS_SYNC_KEY);
+        if (hardFailures.length > 0) {
           eventDispatcher.dispatch('toast', { message: _('WebDAV 自动同步失败'), type: 'warning' });
         }
-        if (conflicts.length === 0 && failures.length === 0) {
+        if (conflicts.length === 0 && hardFailures.length === 0) {
           useWebDavStore.getState().setLastSuccessAt(Date.now());
           // 自动同步覆盖全库（含墓碑书）：全量扫描未检出冲突 → 清理已收敛的
           // 历史冲突条目（可能已被其他设备解决）。只清当前同步 profile 的：

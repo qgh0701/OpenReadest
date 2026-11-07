@@ -267,3 +267,155 @@ export const syncStatisticsWithWebDav = async (
   }
   return { status: 'failed', error: '阅读统计并发写入冲突，下次同步重试' };
 };
+
+// ---------------------------------------------------------------------------
+// 容错校验与修复（供「同步验证」使用）
+//
+// 严格版 parseStatisticsSnapshot 是「全有或全无」：任何一行坏就拒绝整个远端
+// 文件、也绝不覆盖远端。这是安全优先的正确策略，但远端文件真坏了一行时，
+// 统计同步会每轮失败、永久阻塞。下面两个函数不改变默认同步行为，只供诊断
+// 与一键修复入口调用，因此既有同步语义和单元测试完全不受影响。
+// ---------------------------------------------------------------------------
+
+export interface StatisticsSnapshotTolerantResult {
+  ok: boolean;
+  snapshot?: StatisticsSnapshotV1;
+  error?: string;
+  skippedBooks: number;
+  skippedRows: number;
+}
+
+/** 跳过损坏的书目记录与事件行，保留其余合法数据。格式/版本不匹配仍整体拒绝。 */
+export const parseStatisticsSnapshotTolerant = (
+  text: string,
+): StatisticsSnapshotTolerantResult => {
+  let value: unknown;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    return { ok: false, error: '阅读统计文件不是合法 JSON', skippedBooks: 0, skippedRows: 0 };
+  }
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return { ok: false, error: '阅读统计文件格式无法识别', skippedBooks: 0, skippedRows: 0 };
+  }
+  const { format, version, books: rawBooks, pageStats: rawRows } = value as Record<string, unknown>;
+  if (format !== STATISTICS_SNAPSHOT_FORMAT) {
+    return { ok: false, error: '阅读统计文件格式无法识别', skippedBooks: 0, skippedRows: 0 };
+  }
+  // 版本不兼容可能是更新的客户端写的，宁可不修也不能覆盖。
+  if (version !== STATISTICS_SNAPSHOT_VERSION) {
+    return {
+      ok: false,
+      error: '阅读统计文件版本不受支持，可能来自更新的客户端',
+      skippedBooks: 0,
+      skippedRows: 0,
+    };
+  }
+  if (
+    typeof rawBooks !== 'object' ||
+    rawBooks === null ||
+    Array.isArray(rawBooks) ||
+    !Array.isArray(rawRows)
+  ) {
+    return { ok: false, error: '阅读统计文件结构损坏', skippedBooks: 0, skippedRows: 0 };
+  }
+  const books = new Map<string, StatisticsSnapshotBook>();
+  let skippedBooks = 0;
+  for (const [md5, b] of Object.entries(rawBooks)) {
+    if (!md5 || typeof b !== 'object' || b === null) {
+      skippedBooks += 1;
+      continue;
+    }
+    const { title, authors, pages } = b as Record<string, unknown>;
+    if (typeof title !== 'string' || typeof authors !== 'string' || !isNonNegativeInt(pages)) {
+      skippedBooks += 1;
+      continue;
+    }
+    books.set(md5, { title, authors, pages });
+  }
+  const pageStats: StatisticsSnapshotRow[] = [];
+  let skippedRows = 0;
+  for (const row of rawRows as unknown[]) {
+    if (!Array.isArray(row) || row.length !== 5) {
+      skippedRows += 1;
+      continue;
+    }
+    const [md5, page, startTime, duration, totalPages] = row as unknown[];
+    if (
+      typeof md5 !== 'string' ||
+      !md5 ||
+      !isNonNegativeInt(page) ||
+      !isNonNegativeInt(startTime) ||
+      !isNonNegativeInt(duration) ||
+      !isNonNegativeInt(totalPages)
+    ) {
+      skippedRows += 1;
+      continue;
+    }
+    pageStats.push([md5, page, startTime, duration, totalPages]);
+  }
+  return {
+    ok: true,
+    snapshot: {
+      format: STATISTICS_SNAPSHOT_FORMAT,
+      version: STATISTICS_SNAPSHOT_VERSION,
+      books: Object.fromEntries(books),
+      pageStats,
+    },
+    skippedBooks,
+    skippedRows,
+  };
+};
+
+export interface StatisticsRepairResult {
+  ok: boolean;
+  message: string;
+  backupPath?: string;
+  skippedBooks?: number;
+  skippedRows?: number;
+}
+
+/**
+ * 备份损坏的远端快照 → 只导入合法行 → 把合并后的本地全量推回。
+ * 原文件始终先备份成功才动；任何一步失败都保持远端原样。
+ */
+export const repairRemoteStatistics = async (
+  client: StatisticsSyncClient,
+  stats: StatisticsDb,
+): Promise<StatisticsRepairResult> => {
+  const res = await client.get(REMOTE_STATISTICS_PATH);
+  if (!res.ok || !res.data) return { ok: false, message: '读取远端阅读统计文件失败' };
+  const text = new TextDecoder().decode(res.data);
+  const parsed = parseStatisticsSnapshotTolerant(text);
+  if (!parsed.ok || !parsed.snapshot) {
+    return { ok: false, message: parsed.error ?? '远端阅读统计文件无法修复' };
+  }
+  const backupPath = `${READEST_WEBDAV_SYSTEM_DIR}/statistics.broken-${Date.now()}.json`;
+  const backup = await client.put(backupPath, new TextEncoder().encode(text), {
+    contentType: 'application/json; charset=utf-8',
+  });
+  if (!backup.ok) return { ok: false, message: '备份远端文件失败，未做任何修改' };
+  try {
+    await importStatisticsSnapshot(stats, parsed.snapshot);
+    const merged = serializeStatisticsSnapshot(await exportStatisticsSnapshot(stats));
+    const put = await client.put(REMOTE_STATISTICS_PATH, new TextEncoder().encode(merged), {
+      contentType: 'application/json; charset=utf-8',
+    });
+    if (!put.ok) {
+      return { ok: false, message: '写回修复结果失败，原文件已备份', backupPath };
+    }
+  } catch (error) {
+    return {
+      ok: false,
+      message: '合并阅读统计失败，原文件已备份：' + ((error as Error).message || ''),
+      backupPath,
+    };
+  }
+  return {
+    ok: true,
+    message: `已修复：跳过 ${parsed.skippedRows} 条损坏记录、${parsed.skippedBooks} 条损坏书目`,
+    backupPath,
+    skippedBooks: parsed.skippedBooks,
+    skippedRows: parsed.skippedRows,
+  };
+};

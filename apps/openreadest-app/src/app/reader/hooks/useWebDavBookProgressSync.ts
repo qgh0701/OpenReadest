@@ -1,81 +1,53 @@
-import { useEffect } from 'react';
+import { useEffect, useRef } from 'react';
 import { useEnv } from '@/context/EnvContext';
-import { useLibraryStore } from '@/store/libraryStore';
-import { useWebDavStore } from '@/store/webdavStore';
-import { syncWebDavSelection } from '@/services/webdav/sync/engine';
-import {
-  applyDownloadedBookConfigs,
-  pushClosedBookConfig,
-} from '@/services/webdav/sync/applyRemoteConfigs';
 import { useTranslation } from '@/hooks/useTranslation';
 import { eventDispatcher } from '@/utils/event';
+import {
+  pullRemoteBookProgress,
+  pushClosedBookConfig,
+} from '@/services/webdav/sync/applyRemoteConfigs';
 
 /**
- * 打开书时定向预拉取该书的 config.json（仅配置文件、不拉书文件/封面/书库），
- * 拉到远端新进度立即应用到内存与阅读视图；关闭书（sync-book-progress 事件）
- * 时把刚保存的进度立即推送到 WebDAV。仅配置了 WebDAV profile 时生效。
+ * 打开书时定向拉取该书的远端 config.json（一次 GET，不惊动书文件、封面、
+ * 书库索引），把进度直接应用到内存、磁盘和阅读视图；关书（sync-book-progress
+ * 事件）时把刚保存的进度推回 WebDAV。
  *
- * 此前的进度跨设备链路只有"自动同步周期 / 手动同步"一个入口，且拉取结果
- * 只落盘不进内存（见 applyDownloadedBookConfigs 的说明）——换设备接力时
- * 必须手动同步并重开书才能拿到进度，或干脆被本地旧进度覆盖。
+ * 第一版实现走 syncWebDavSelection，但它依赖引擎的指纹 / 内容合并 / 冲突
+ * 策略：纯阅读书的 config.json 不含 booknotes 字段 → 内容合并返回 null →
+ * 默认 manual 策略把 config 记为冲突跳过；即便成功落盘，若引擎判定「无需
+ * 同步」则 appliedConfigKeys 为空，胶水根本不执行。改走直接读取后，这条
+ * 链路与同步状态机完全解耦，也不会占用 isSyncing 阻塞自动同步。
  */
 export const useWebDavBookProgressSync = (bookKey: string) => {
   const { appService } = useEnv();
   const _ = useTranslation();
+  const remoteReachableRef = useRef(false);
 
   useEffect(() => {
     if (!appService || !bookKey) return;
     let cancelled = false;
+    remoteReachableRef.current = false;
 
     const runOpenSync = async () => {
-      try {
-        const store = useWebDavStore.getState();
-        const profile =
-          store.profiles.find((p) => p.id === store.activeProfileId) ?? store.profiles[0];
-        if (!profile?.serverUrl || !profile?.username) return;
-        if (store.isSyncing) return;
-        const bookHash = bookKey.split('-')[0]!;
-        const book = useLibraryStore.getState().library.find((b) => b.hash === bookHash);
-        if (!book) return;
-
-        useWebDavStore.getState().setSyncing(true);
-        try {
-          const { appliedConfigKeys } = await syncWebDavSelection(
-            appService,
-            profile,
-            {
-              books: [book],
-              includeLibrary: false,
-              includeBookFiles: false,
-              includeCovers: false,
-              includeConfig: true,
-              includeStatistics: false,
-            },
-            { onLog: () => {} },
-            { shouldCancel: () => cancelled },
-          );
-          if (!cancelled) {
-            await applyDownloadedBookConfigs(
-              appService,
-              appliedConfigKeys,
-              _('Reading Progress Synced'),
-            );
-          }
-        } finally {
-          // 取消路径同样要释放互斥，否则自动同步与手动同步会被永久卡死
-          useWebDavStore.getState().setSyncing(false);
+      for (let attempt = 0; attempt < 3 && !cancelled; attempt++) {
+        if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, 1000));
+        const ok = await pullRemoteBookProgress(
+          appService,
+          bookKey,
+          _('Reading Progress Synced'),
+        );
+        if (ok) {
+          remoteReachableRef.current = true;
+          return;
         }
-      } catch {
-        // 打开时的预拉取失败不打断阅读：下一轮同步自然收敛
       }
     };
-
-    runOpenSync();
+    void runOpenSync();
 
     const handleCloseSync = (event: CustomEvent) => {
       const { bookKey: closedKey } = event.detail ?? {};
       if (closedKey !== bookKey || !appService) return;
-      void pushClosedBookConfig(appService, bookKey);
+      void pushClosedBookConfig(appService, bookKey, remoteReachableRef.current);
     };
     eventDispatcher.on('sync-book-progress', handleCloseSync);
 
