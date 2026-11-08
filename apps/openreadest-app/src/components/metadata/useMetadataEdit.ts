@@ -9,7 +9,11 @@ import {
 } from '@/utils/validation';
 import { MetadataSource } from './SourceSelector';
 import { searchMetadata } from '@/libs/metadata';
+import type { MetadataSourceName } from '@/services/metadata/clientSearch';
 import { formatAuthors, formatTitle, getPrimaryLanguage } from '@/utils/book';
+
+/** 元数据检索来源：auto = 豆瓣优先、失败再试 Open Library */
+export type MetadataSourceChoice = MetadataSourceName | 'auto';
 
 export const useMetadataEdit = (metadata: BookMetadata | null) => {
   const [editedMeta, setEditedMeta] = useState<BookMetadata>({} as BookMetadata);
@@ -20,6 +24,7 @@ export const useMetadataEdit = (metadata: BookMetadata | null) => {
   const [searchLoading, setSearchLoading] = useState(false);
   const [showSourceSelection, setShowSourceSelection] = useState(false);
   const [availableSources, setAvailableSources] = useState<MetadataSource[]>([]);
+  const [metadataSource, setMetadataSource] = useState<MetadataSourceChoice>('auto');
 
   const lockableFields = [
     'title',
@@ -168,17 +173,25 @@ export const useMetadataEdit = (metadata: BookMetadata | null) => {
     setSearchLoading(true);
     try {
       const isbnValidation = validateISBN(editedMeta.identifier || '');
-      const results = await searchMetadata({
-        title: formatTitle(editedMeta.title),
-        author: formatAuthors(editedMeta.author),
-        isbn: isbnValidation.isValid ? editedMeta.identifier : undefined,
-        language: getPrimaryLanguage(editedMeta.language),
-      });
+      const results = await searchMetadata(
+        {
+          title: formatTitle(editedMeta.title),
+          author: formatAuthors(editedMeta.author),
+          isbn: isbnValidation.isValid ? editedMeta.identifier : undefined,
+          language: getPrimaryLanguage(editedMeta.language),
+        },
+        metadataSource === 'auto' ? undefined : { sources: [metadataSource] },
+      );
       const metadataSources = results.map((result) => ({
         sourceName: result.providerName,
         sourceLabel: result.providerLabel,
         confidence: result.confidence,
         data: result.metadata as BookMetadata,
+        // 评分不属于 BookMetadata（不写回书里），只在来源卡片上展示，
+        // 所以单独挂在 MetadataSource 上带过去。
+        rating: result.metadata.rating,
+        ratingCount: result.metadata.ratingCount,
+        ratingSource: result.metadata.ratingSource,
       }));
       setAvailableSources(metadataSources);
       setShowSourceSelection(true);
@@ -230,6 +243,8 @@ export const useMetadataEdit = (metadata: BookMetadata | null) => {
     searchLoading,
     showSourceSelection,
     availableSources,
+    metadataSource,
+    setMetadataSource,
     handleFieldChange,
     handleFieldValidation,
     handleToggleFieldLock,

@@ -64,6 +64,8 @@ const BookDetailModal: React.FC<BookDetailModalProps> = ({
     searchLoading,
     showSourceSelection,
     availableSources,
+    metadataSource,
+    setMetadataSource,
     handleFieldChange,
     handleToggleFieldLock,
     handleLockAll,
@@ -209,6 +211,8 @@ const BookDetailModal: React.FC<BookDetailModalProps> = ({
                 lockedFields={lockedFields}
                 fieldErrors={fieldErrors}
                 searchLoading={searchLoading}
+                metadataSource={metadataSource}
+                onMetadataSourceChange={setMetadataSource}
                 onFieldChange={handleFieldChange}
                 onToggleFieldLock={handleToggleFieldLock}
                 onAutoRetrieve={handleAutoRetrieve}

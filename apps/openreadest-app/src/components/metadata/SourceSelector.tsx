@@ -13,6 +13,10 @@ export interface MetadataSource {
   sourceLabel: string;
   confidence: number;
   data: BookMetadata;
+  /** 豆瓣等书评站评分；来源没有评分时为 undefined，界面显示「暂无评分」 */
+  rating?: number;
+  ratingCount?: number;
+  ratingSource?: string;
 }
 
 interface SourceSelectorProps {
@@ -52,6 +56,11 @@ const SourceSelector: React.FC<SourceSelectorProps> = ({ sources, isOpen, onSele
         <h3 className='mb-4 text-lg font-semibold'>{_('Select Metadata Source')}</h3>
 
         <div className='space-y-3'>
+          {sources.length === 0 && (
+            <div className='text-base-content/60 rounded-md border border-dashed p-6 text-center text-sm'>
+              {_('暂无相关信息：没有搜到匹配的书目，请手动填写，或换个书名 / ISBN 再试。')}
+            </div>
+          )}
           {sources.map((source, index) => (
             <button
               tabIndex={0}
@@ -89,6 +98,21 @@ const SourceSelector: React.FC<SourceSelectorProps> = ({ sources, isOpen, onSele
                       {source.data.publisher ? `${source.data.publisher} • ` : ''}
                       {source.data.published}
                     </div>
+                    {source.rating !== undefined ? (
+                      <div className='flex items-center gap-1 text-sm'>
+                        <span className='font-semibold text-orange-500'>
+                          {source.rating.toFixed(1)}
+                        </span>
+                        <span className='text-gray-500'>
+                          {source.ratingSource ? `· ${source.ratingSource}` : ''}
+                          {source.ratingCount
+                            ? ` · ${_('{{count}} 人评价', { count: source.ratingCount })}`
+                            : ''}
+                        </span>
+                      </div>
+                    ) : (
+                      <div className='text-xs text-gray-400'>{_('暂无评分')}</div>
+                    )}
                     {source.data.identifier && (
                       <div className='text-gray-500'>Identifier: {source.data.identifier}</div>
                     )}

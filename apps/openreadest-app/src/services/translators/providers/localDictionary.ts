@@ -17,7 +17,16 @@ import { TranslationProvider } from '../types';
  */
 
 const MAX_WORDS = 16;
-const MAX_CANDIDATES = 2;
+/**
+ * 候选词上限。
+ *
+ * `buildLookupCandidates` 的去重后顺序是「原样 / 小写 / 首字母大写 / 全大写 /
+ * 词形还原」，之前取 2 个，等于永远轮不到词形还原那一段：查 running 时只试了
+ * running 和 Running，run 根本没被查——「词形变化查不到」就是这么来的。
+ * 取 5 个正好覆盖前四种大小写变体加至少一个词形候选；查询本身走 reader 内的
+ * Map / 索引缓存，多试几次的代价远小于查不到。
+ */
+const MAX_CANDIDATES = 5;
 const MAX_DEFINITION_LEN = 260;
 
 interface LookupHit {
@@ -58,9 +67,12 @@ const tokenize = (text: string): string[] => {
 const lookupOne = async (
   appService: Awaited<ReturnType<typeof environmentConfig.getAppService>>,
   word: string,
+  sourceLang?: string,
 ): Promise<LookupHit | null> => {
   const settings = useSettingsStore.getState().settings;
-  for (const candidate of buildLookupCandidates(word).slice(0, MAX_CANDIDATES)) {
+  // 传 sourceLang 才能走到词形还原（ran → run、mice → mouse）：只对英语类
+  // 词典有意义，其它语言 getLemmaCandidates 会直接返回空。
+  for (const candidate of buildLookupCandidates(word, sourceLang).slice(0, MAX_CANDIDATES)) {
     const [custom, standard] = await Promise.all([
       lookupWordlists(appService, settings.customWordlists ?? [], candidate).catch(() => []),
       lookupImportedDictionaries(appService, settings.customDictionaries ?? [], candidate).catch(
@@ -89,7 +101,7 @@ const formatResult = (original: string, hits: LookupHit[]): string => {
 export const localDictionaryProvider: TranslationProvider = {
   name: 'local-dictionary',
   label: _('本地词典（离线）'),
-  translate: async (texts: string[]): Promise<string[]> => {
+  translate: async (texts: string[], sourceLang?: string): Promise<string[]> => {
     if (!texts.length) return [];
     const appService = await environmentConfig.getAppService();
     const results: string[] = [];
@@ -102,7 +114,7 @@ export const localDictionaryProvider: TranslationProvider = {
       }
       const hits: LookupHit[] = [];
       for (const word of tokenize(text)) {
-        const hit = await lookupOne(appService, word);
+        const hit = await lookupOne(appService, word, sourceLang);
         if (hit) hits.push(hit);
       }
       results.push(formatResult(text, hits));

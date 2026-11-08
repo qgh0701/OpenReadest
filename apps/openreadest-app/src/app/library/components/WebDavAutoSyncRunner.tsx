@@ -13,6 +13,7 @@ import { getLocalLibraryPath } from '@/services/webdav/sync/paths';
 import { useSettingsStore } from '@/store/settingsStore';
 import { isReadingStatsEnabled } from '@/services/statistics/remainingTime';
 import { STATISTICS_SYNC_KEY } from '@/services/statistics/statisticsSync';
+import { resolveSyncScope } from '@/services/webdav/models';
 import { eventDispatcher } from '@/utils/event';
 
 const shouldRun = () => {
@@ -48,6 +49,8 @@ const WebDavAutoSyncRunner = () => {
       const profile =
         store.profiles.find((p) => p.id === store.activeProfileId) ?? store.profiles[0];
       if (!profile?.serverUrl || !profile?.username) return;
+      // 同步范围随 profile 持久化；老 profile 缺该字段时按默认全开
+      const scope = resolveSyncScope(profile);
 
       // Part 4.1：已删（deletedAt 墓碑）的书也必须纳入同步项，由引擎按条目级
       // 墓碑把删除传播到远端（删除远端书文件 + 写状态墓碑），library.json 的
@@ -79,7 +82,10 @@ const WebDavAutoSyncRunner = () => {
           profile,
           {
             books,
-            includeLibrary: true,
+            includeLibrary: scope.library,
+            includeBookFiles: scope.bookFiles,
+            includeConfig: scope.config,
+            includeCovers: scope.covers,
             includeStatistics: isReadingStatsEnabled(useSettingsStore.getState().settings),
           },
           {

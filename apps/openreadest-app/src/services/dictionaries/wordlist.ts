@@ -92,6 +92,25 @@ const splitCsvLine = (line: string): string[] => {
   return out;
 };
 
+const HAN = /[\u3400-\u9fff\uf900-\ufaff]/;
+const LATIN_WORD = /^[A-Za-z\u00C0-\u024F][A-Za-z\u00C0-\u024F'’.\- ]*$/;
+
+/**
+ * 「单词 释义」这种最朴素的词表（教材词汇表、自己抄的清单）里没有任何显式
+ * 分隔符，只能靠字符类型切：左侧是拉丁词、右侧以汉字开头时，把第一个汉字
+ * 之前的部分当词条。这样 `hello 你好`、`give up 放弃`、`apple 苹果，苹果树`
+ * 都能解析，而纯英文行（`hello world`，无汉字）不敢乱切，返回 null 由调用方跳过。
+ */
+const splitByScript = (line: string): string[] | null => {
+  const idx = line.search(HAN);
+  if (idx <= 0) return null;
+  const head = line.slice(0, idx).trim();
+  const tail = line.slice(idx).trim();
+  if (!head || !tail) return null;
+  if (!LATIN_WORD.test(head)) return null;
+  return [head, tail];
+};
+
 const parseLine = (line: string): Entry | null => {
   const trimmed = line.trim();
   if (!trimmed || trimmed.startsWith('#') || trimmed.startsWith('//')) return null;
@@ -99,8 +118,10 @@ const parseLine = (line: string): Entry | null => {
   if (trimmed.includes('\t')) parts = trimmed.split('\t');
   else if (trimmed.includes('::')) parts = trimmed.split('::', 2);
   else if (trimmed.includes('=')) parts = trimmed.split('=', 2);
+  else if (trimmed.includes('\u3000')) parts = trimmed.split('\u3000', 2);
+  else if (/\S {2,}\S/.test(trimmed)) parts = trimmed.split(/ {2,}/, 2);
   else if (trimmed.includes(',')) parts = splitCsvLine(trimmed);
-  else return null;
+  else parts = splitByScript(trimmed) ?? [];
   if (parts.length < 2) return null;
   const word = unquote(parts[0]!);
   const definition = unquote(parts.slice(1).join(' ')).replace(/\s+/g, ' ');

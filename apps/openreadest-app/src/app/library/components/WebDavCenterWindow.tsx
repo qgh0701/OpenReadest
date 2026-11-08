@@ -45,6 +45,8 @@ import {
   WebDavConflictItem,
   WebDavConflictResolutionStrategy,
   WebDavProfile,
+  WebDavSyncScope,
+  resolveSyncScope,
 } from '@/services/webdav/models';
 import {
   getUniqueWebDavProfileName,
@@ -54,9 +56,12 @@ import { Book, BookFormat } from '@/types/book';
 import { EXTS } from '@/libs/document';
 import { verifyWebDavSync, VerifyReport } from '@/services/webdav/sync/verify';
 import {
+  captureClosedBookConfig,
+  describeConfigSyncFailure,
   pullBookConfigToDisk,
   pullRemoteBookProgress,
   pushBookConfig,
+  readRemoteBookPosition,
 } from '@/services/webdav/sync/applyRemoteConfigs';
 import { repairRemoteStatistics, STATISTICS_SYNC_KEY } from '@/services/statistics/statisticsSync';
 import { StatisticsDb } from '@/services/statistics/statisticsDb';
@@ -159,6 +164,20 @@ export const WebDavCenterWindow = () => {
   const [showVerifyDetails, setShowVerifyDetails] = useState(true);
   // 验证明细里针对单本书的强制拉取 / 推送正在进行（`<hash>:pull` 形式）
   const [busyBookAction, setBusyBookAction] = useState<string | null>(null);
+  // 「单本手动同步」：验证明细只覆盖书架前 24 本，排在后面的书在面板里根本
+  // 看不到按钮。这里提供一条不依赖顺序的通道——按书名挑任意一本，查两端位置，
+  // 再由用户决定用哪一端覆盖哪一端。
+  const [manualFilter, setManualFilter] = useState('');
+  const [manualHash, setManualHash] = useState('');
+  const [manualInfo, setManualInfo] = useState<{
+    hash: string;
+    title: string;
+    localLocation?: string;
+    remoteLocation?: string;
+    remoteUpdatedAt?: number;
+    remoteFound: boolean;
+  } | null>(null);
+  const [isManualLoading, setIsManualLoading] = useState(false);
 
   useEffect(() => {
     const handleCustomEvent = (event: CustomEvent) => {
@@ -262,6 +281,13 @@ export const WebDavCenterWindow = () => {
 
   const showToast = (message: string, type: 'success' | 'error' | 'info' | 'warning' = 'info') => {
     eventDispatcher.dispatch('toast', { message, type });
+  };
+
+  // 同步范围：读当前编辑中的 profile（老 profile 没有该字段时按默认全开），
+  // 改动即时写回 editing，保存 profile 时一起持久化。
+  const syncScope = resolveSyncScope(editing);
+  const updateSyncScope = (patch: Partial<WebDavSyncScope>) => {
+    setEditing((prev) => ({ ...prev, syncScope: { ...resolveSyncScope(prev), ...patch } }));
   };
 
   const buildValidatedProfile = () => {
@@ -592,12 +618,19 @@ export const WebDavCenterWindow = () => {
         await upsertRemoteLibraryIndex(client, pickBooks);
       }
 
+      const manualScope = resolveSyncScope(profile);
       const { failures, conflicts, appliedConfigKeys } = await syncWebDavSelection(
         appService,
         profile,
         {
           books: pickBooks,
+          // 上传/下载「选中书籍」是逐书语义：不合并整个书架索引，否则用户只勾了
+          // 一本书，却把全库索引拉进来（这也是之前「只想同步一本，结果整库都
+          // 下来了」的来源）。书架与分组的同步走「立刻同步」或自动同步。
           includeLibrary: false,
+          includeBookFiles: manualScope.bookFiles,
+          includeConfig: manualScope.config,
+          includeCovers: manualScope.covers,
           includeStatistics: isReadingStatsEnabled(useSettingsStore.getState().settings),
         },
         {
@@ -695,12 +728,16 @@ export const WebDavCenterWindow = () => {
     }
     useWebDavStore.getState().setSyncing(true);
     try {
+      const scope = resolveSyncScope(profile);
       const { failures, conflicts, appliedConfigKeys } = await syncWebDavSelection(
         appService,
         profile,
         {
           books: allBooks,
-          includeLibrary: true,
+          includeLibrary: scope.library,
+          includeBookFiles: scope.bookFiles,
+          includeConfig: scope.config,
+          includeCovers: scope.covers,
           includeStatistics: isReadingStatsEnabled(useSettingsStore.getState().settings),
         },
         {
@@ -815,19 +852,25 @@ export const WebDavCenterWindow = () => {
         } else {
           const res = await pullBookConfigToDisk(appService, book, { force: true });
           showToast(
-            res.ok ? _('已用云端进度覆盖本机') : _('拉取失败：') + res.reason,
+            res.ok ? _('已用云端进度覆盖本机') : _('拉取失败：') + describeConfigSyncFailure(res.reason),
             res.ok ? 'success' : 'error',
           );
         }
       } else {
         const settings = useSettingsStore.getState().settings;
-        const config = await appService.loadBookConfig(book, settings);
+        // 书正开着时优先用内存快照：磁盘上可能还是 10 秒前那次节流保存，
+        // 直接读磁盘会把旧位置推上去（v5 里这是「点了推送却没生效」的来源之一）。
+        const openKey = useReaderStore.getState().bookKeys.find((k) => k.split('-')[0] === hash);
+        const snapshot = openKey ? captureClosedBookConfig(openKey) : null;
+        const config = snapshot ?? (await appService.loadBookConfig(book, settings));
         if (!config?.location) {
           showToast(_('本机没有这本书的阅读位置'), 'warning');
         } else {
           const res = await pushBookConfig(book, config, { force: true });
           showToast(
-            res.ok ? _('已把本机进度推送到云端') : _('推送失败：') + res.reason,
+            res.ok
+              ? _('已把本机进度推送到云端')
+              : _('推送失败：') + describeConfigSyncFailure(res.reason),
             res.ok ? 'success' : 'error',
           );
         }
@@ -837,6 +880,45 @@ export const WebDavCenterWindow = () => {
       showToast(_('操作失败：') + ((error as Error).message || ''), 'error');
     } finally {
       setBusyBookAction(null);
+    }
+  };
+
+  /**
+   * 「单本手动同步」的查询步骤：只读，各读一次（本地磁盘 config + 远端 config），
+   * 不写任何文件。用于处理「这本书在书架 24 名之后、验证面板看不到」的情况。
+   */
+  const queryManualBook = async () => {
+    if (!appService || !manualHash) return;
+    const book = useLibraryStore.getState().library.find((b) => b.hash === manualHash);
+    if (!book) {
+      showToast(_('书架里找不到这本书'), 'warning');
+      return;
+    }
+    setIsManualLoading(true);
+    try {
+      const profile = buildValidatedProfile();
+      if (!profile) return;
+      const settings = useSettingsStore.getState().settings;
+      let localLocation: string | undefined;
+      try {
+        const localConfig = await appService.loadBookConfig(book, settings);
+        localLocation = localConfig?.location ?? undefined;
+      } catch {
+        localLocation = undefined;
+      }
+      const remote = await readRemoteBookPosition(book, { profile });
+      setManualInfo({
+        hash: book.hash,
+        title: book.title || book.hash.slice(0, 12),
+        localLocation,
+        remoteLocation: remote?.location,
+        remoteUpdatedAt: remote?.updatedAt,
+        remoteFound: !!remote,
+      });
+    } catch (error) {
+      showToast(_('查询失败：') + ((error as Error).message || ''), 'error');
+    } finally {
+      setIsManualLoading(false);
     }
   };
 
@@ -1158,6 +1240,62 @@ export const WebDavCenterWindow = () => {
                 <option value='local'>{_('本地优先')}</option>
                 <option value='remote'>{_('云端优先')}</option>
               </select>
+            </div>
+          </div>
+
+          {/* 同步范围：四项独立开关，直接决定引擎发多少请求 */}
+          <div className='border-base-300 rounded-md border p-3'>
+            <div className='mb-2 flex items-center justify-between'>
+              <span className='text-sm font-medium'>{_('同步范围')}</span>
+              <button
+                className='btn btn-ghost btn-xs'
+                onClick={() =>
+                  updateSyncScope({ bookFiles: true, config: true, covers: true, library: true })
+                }
+              >
+                {_('全部开启')}
+              </button>
+            </div>
+            <div className='grid grid-cols-1 gap-2 sm:grid-cols-2'>
+              <label className='flex items-center gap-2'>
+                <input
+                  type='checkbox'
+                  className='checkbox checkbox-sm'
+                  checked={syncScope.bookFiles}
+                  onChange={(e) => updateSyncScope({ bookFiles: e.target.checked })}
+                />
+                <span className='text-sm'>{_('书籍本体（文件）')}</span>
+              </label>
+              <label className='flex items-center gap-2'>
+                <input
+                  type='checkbox'
+                  className='checkbox checkbox-sm'
+                  checked={syncScope.config}
+                  onChange={(e) => updateSyncScope({ config: e.target.checked })}
+                />
+                <span className='text-sm'>{_('阅读进度与排版设置')}</span>
+              </label>
+              <label className='flex items-center gap-2'>
+                <input
+                  type='checkbox'
+                  className='checkbox checkbox-sm'
+                  checked={syncScope.covers}
+                  onChange={(e) => updateSyncScope({ covers: e.target.checked })}
+                />
+                <span className='text-sm'>{_('书籍封面')}</span>
+              </label>
+              <label className='flex items-center gap-2'>
+                <input
+                  type='checkbox'
+                  className='checkbox checkbox-sm'
+                  checked={syncScope.library}
+                  onChange={(e) => updateSyncScope({ library: e.target.checked })}
+                />
+                <span className='text-sm'>{_('书架与分组')}</span>
+              </label>
+            </div>
+            <div className='text-base-content/50 mt-2 text-xs'>
+              {_('「书架与分组」决定分组信息是否跨设备同步；关掉「书籍本体」可显著减少请求数（也是最容易触发云端限流的一项）。')}
             </div>
           </div>
 
@@ -1770,6 +1908,91 @@ export const WebDavCenterWindow = () => {
                 )}
               </div>
             )}
+
+            <div className='border-base-300 bg-base-100 mt-3 rounded-lg border p-3'>
+              <div className='font-medium'>{_('单本手动同步')}</div>
+              <div className='text-base-content/60 mt-1 text-xs'>
+                {_(
+                  '同步验证只检查书架前 24 本。想同步的书若排在后面，用这里挑出来，手工决定用哪一端覆盖哪一端。',
+                )}
+              </div>
+              <div className='mt-2 flex flex-col gap-2 sm:flex-row'>
+                <input
+                  className='input input-bordered input-sm w-full sm:w-36'
+                  value={manualFilter}
+                  onChange={(e) => setManualFilter(e.target.value)}
+                  placeholder={_('筛选书名')}
+                />
+                <select
+                  className='select select-bordered select-sm w-full flex-1'
+                  value={manualHash}
+                  onChange={(e) => {
+                    setManualHash(e.target.value);
+                    setManualInfo(null);
+                  }}
+                >
+                  <option value=''>{_('选择一本书')}</option>
+                  {library
+                    .filter((b) => {
+                      const q = manualFilter.trim().toLowerCase();
+                      if (!q) return true;
+                      return (b.title || '').toLowerCase().includes(q);
+                    })
+                    .slice(0, 50)
+                    .map((b) => (
+                      <option key={b.hash} value={b.hash}>
+                        {b.title || b.hash.slice(0, 12)}
+                      </option>
+                    ))}
+                </select>
+                <button
+                  className='btn btn-outline btn-sm'
+                  disabled={!manualHash || isManualLoading}
+                  onClick={() => void queryManualBook()}
+                >
+                  {isManualLoading ? _('查询中…') : _('查询两端位置')}
+                </button>
+              </div>
+              {manualInfo && (
+                <div className='border-base-200 mt-2 border-t pt-2 text-xs'>
+                  <div className='font-medium'>{manualInfo.title}</div>
+                  <div className='text-base-content/70 mt-1'>
+                    {manualInfo.remoteFound
+                      ? `${_('本机')}：${manualInfo.localLocation ? _('有阅读位置') : _('没有阅读位置')}　${_('云端')}：${manualInfo.remoteLocation ? _('有阅读位置') : _('云端这份没有位置')}`
+                      : `${_('本机')}：${manualInfo.localLocation ? _('有阅读位置') : _('没有阅读位置')}　${_('云端')}：${_('云端还没有这本书的 config.json')}`}
+                  </div>
+                  {(manualInfo.localLocation || manualInfo.remoteLocation) && (
+                    <div className='text-base-content/50 mt-1 break-all text-[11px]'>
+                      {_('本机位置')} {manualInfo.localLocation?.slice(0, 30) || '—'} ·{' '}
+                      {_('云端位置')} {manualInfo.remoteLocation?.slice(0, 30) || '—'}
+                    </div>
+                  )}
+                  <div className='mt-1 flex flex-wrap gap-1'>
+                    <button
+                      className='btn btn-ghost btn-xs'
+                      disabled={!manualInfo.remoteLocation || !!busyBookAction}
+                      onClick={() => void runBookConfigAction(manualInfo.hash, 'pull')}
+                    >
+                      {busyBookAction === `${manualInfo.hash}:pull`
+                        ? _('拉取中…')
+                        : _('← 用云端覆盖本机')}
+                    </button>
+                    <button
+                      className='btn btn-ghost btn-xs'
+                      disabled={!manualInfo.localLocation || !!busyBookAction}
+                      onClick={() => void runBookConfigAction(manualInfo.hash, 'push')}
+                    >
+                      {busyBookAction === `${manualInfo.hash}:push`
+                        ? _('推送中…')
+                        : _('把本机进度推上云端 →')}
+                    </button>
+                  </div>
+                  <div className='text-base-content/50 mt-1 text-[11px]'>
+                    {_('书开着也可以：会取当前实时位置；关着则取已落盘的进度。')}
+                  </div>
+                </div>
+              )}
+            </div>
 
             <div className='mt-3 flex items-center justify-between'>
               <button className='btn btn-ghost btn-sm' onClick={togglePause} disabled={!isSyncing}>

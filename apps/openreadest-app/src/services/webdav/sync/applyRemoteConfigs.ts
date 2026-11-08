@@ -14,7 +14,7 @@ import { getRemoteBookPaths } from './paths';
 import { mergeWebDavJsonContent } from './contentMerge';
 
 /** 补丁版本标记：显示在「同步验证」报告首行，用于确认两端跑的是同一版。 */
-export const CONFIG_SYNC_PATCH_TAG = 'p5-view-ready-goto';
+export const CONFIG_SYNC_PATCH_TAG = 'p7-meta-sync-scope';
 
 export type ConfigSyncResult = {
   ok: boolean;
@@ -668,4 +668,54 @@ export const pushClosedBookConfig = async (
   } catch (error) {
     return { ok: false, reason: (error as Error).message || 'push-failed' };
   }
+};
+
+/**
+ * 把内部失败原因翻译成用户能看懂的一句话。
+ *
+ * 起因：503 原本被原样显示成「连接失败：请检查服务器地址、账号密码与网络」，
+ * 这句话会把人引向错误方向——凭据错是 401/403，503 是云端的访问频率限制
+ * （坚果云按账号限流，超限直接拒绝，与设备、客户端无关）。
+ */
+export const describeConfigSyncFailure = (reason?: string): string => {
+  if (!reason) return '未知原因';
+  if (/503|rate|too.?many/i.test(reason)) {
+    return '云端限流（HTTP 503）：请求过于频繁，请等待约 30 分钟后再试';
+  }
+  if (/put-40[13]/.test(reason)) {
+    return '云端拒绝访问（账号或应用密码错误、或无写入权限）';
+  }
+  switch (reason) {
+    case 'no-profile':
+      return '未配置 WebDAV 账号';
+    case 'book-not-found':
+      return '书架里找不到这本书';
+    case 'no-local-location':
+      return '本机还没有这本书的阅读位置';
+    case 'no-remote-location':
+      return '云端没有这本书的进度';
+    case 'remote-ahead':
+      return '云端进度更靠后，已阻止用旧位置覆盖';
+    case 'local-ahead':
+      return '本机进度更靠后，已阻止回退';
+    case 'pushed':
+      return '已推送';
+    default:
+      return reason;
+  }
+};
+
+/**
+ * 只读：查某本书在云端的进度位置，供「单本手动同步」展示两端差异。
+ * 一次 GET，不写任何文件、不改同步状态。
+ */
+export const readRemoteBookPosition = async (
+  book: Book,
+  options?: { profile?: WebDavProfile },
+): Promise<{ location?: string; updatedAt?: number } | null> => {
+  const profile = options?.profile ?? resolveActiveProfile();
+  if (!profile?.serverUrl || !profile?.username) return null;
+  const remote = await readRemoteBookConfig(profile, book);
+  if (!remote) return null;
+  return { location: remote.location, updatedAt: remote.updatedAt };
 };

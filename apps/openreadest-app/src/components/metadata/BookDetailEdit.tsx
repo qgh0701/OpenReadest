@@ -9,6 +9,7 @@ import { useTranslation } from '@/hooks/useTranslation';
 import { flattenContributors, formatAuthors, formatPublisher, formatTitle } from '@/utils/book';
 import { useFileSelector } from '@/hooks/useFileSelector';
 import { FormField } from './FormField';
+import type { MetadataSourceChoice } from './useMetadataEdit';
 import BookCover from '@/components/BookCover';
 
 interface BookDetailEditProps {
@@ -21,6 +22,8 @@ interface BookDetailEditProps {
   onFieldChange: (field: string, value: string | undefined) => void;
   onToggleFieldLock: (field: string) => void;
   onAutoRetrieve: () => void;
+  metadataSource: MetadataSourceChoice;
+  onMetadataSourceChange: (source: MetadataSourceChoice) => void;
   onLockAll: () => void;
   onUnlockAll: () => void;
   onCancel: () => void;
@@ -40,6 +43,8 @@ const BookDetailEdit: React.FC<BookDetailEditProps> = ({
   onFieldChange,
   onToggleFieldLock,
   onAutoRetrieve,
+  metadataSource,
+  onMetadataSourceChange,
   onLockAll,
   onUnlockAll,
   onCancel,
@@ -316,6 +321,20 @@ const BookDetailEdit: React.FC<BookDetailEditProps> = ({
             <span className='sm:hidden'>{_('Auto')}</span>
             <span className='hidden sm:inline'>{_('Auto-Retrieve')}</span>
           </button>
+
+          {/* 元数据来源：默认豆瓣优先，可指定单一来源 */}
+          <select
+            aria-label={_('元数据来源')}
+            value={metadataSource}
+            onChange={(event) =>
+              onMetadataSourceChange(event.target.value as MetadataSourceChoice)
+            }
+            className='border-base-300 bg-base-100 rounded-md border px-2 py-2 text-sm'
+          >
+            <option value='auto'>{_('自动（豆瓣优先）')}</option>
+            <option value='douban'>{_('豆瓣读书')}</option>
+            <option value='openlibrary'>{_('Open Library')}</option>
+          </select>
 
           {/* Lock/Unlock All Buttons */}
           <div className='flex items-center gap-1 border-l border-gray-300 pl-2'>

@@ -24,5 +24,8 @@ export const buildLookupCandidates = (word: string, lang?: string | null): strin
   const title = trimmed.charAt(0).toUpperCase() + lower.slice(1);
   const upper = trimmed.toUpperCase();
   const lemmas = getLemmaCandidates(lower, lang);
-  return [...new Set([trimmed, lower, title, upper, ...lemmas])];
+  // 词形候选排在大小写变体之前：调用方通常只试有限几个候选，`running` 的
+  // 词形还原会先给出 runn / runne / run，若排在全大写之后就被这些无意义变体
+  // 挤掉，表现为「词形还原形同不存在」。精确匹配仍然最先（trimmed / lower）。
+  return [...new Set([trimmed, lower, ...lemmas, title, upper])];
 };
