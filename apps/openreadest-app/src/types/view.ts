@@ -9,8 +9,17 @@ export const NOTE_PREFIX = 'foliate-note:';
 export interface FoliateView extends HTMLElement {
   open: (book: BookDoc) => Promise<void>;
   close: () => void;
-  init: (options: { lastLocation: string }) => void;
-  goTo: (href: string) => void;
+  init: (options: { lastLocation: string }) => Promise<void>;
+  /**
+   * 跳转到 CFI / href / section index。
+   *
+   * 实际实现（packages/foliate-js/view.js）是 async 的，且**内部 try/catch 吞掉
+   * 全部异常**：定位失败时只 console.error 并 `return undefined`，不会 reject。
+   * 因此「没抛错」不能作为跳转成功的判据，必须看返回值是否为 undefined。
+   * 此前的类型标注写成 `void`，调用方据此用 try/catch 判断成功，导致失败被当成
+   * 成功、重试逻辑一次也不会执行。
+   */
+  goTo: (href: string | number) => Promise<{ index: number } | undefined>;
   goToFraction: (fraction: number) => void;
   prev: (distance?: number) => void;
   next: (distance?: number) => void;

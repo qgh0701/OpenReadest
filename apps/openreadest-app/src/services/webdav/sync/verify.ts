@@ -11,6 +11,7 @@ import {
   REMOTE_STATISTICS_PATH,
 } from '@/services/statistics/statisticsSync';
 import { getRemoteBookPaths, READEST_WEBDAV_BOOKS_DIR } from './paths';
+import { CONFIG_SYNC_PATCH_TAG } from './applyRemoteConfigs';
 
 /**
  * 「同步验证」的只读比对逻辑。
@@ -27,6 +28,12 @@ export interface VerifyItem {
   label: string;
   status: VerifyStatus;
   detail: string;
+  /** 该条目对应的书籍（用于在验证面板里针对单本书强制拉取 / 推送）。 */
+  bookHash?: string;
+  /** 本地有阅读位置（可用于「推送本机进度」）。 */
+  canPush?: boolean;
+  /** 远端有阅读位置（可用于「覆盖为远端进度」）。 */
+  canPull?: boolean;
 }
 
 export interface VerifyReport {
@@ -61,15 +68,33 @@ const parseJson = (text: string | null): unknown => {
   }
 };
 
+const shortCfi = (cfi?: string): string => {
+  if (!cfi) return '-';
+  const matched = /epubcfi\(([^)]*)\)/.exec(cfi);
+  const body = matched ? matched[1]! : cfi;
+  return body.length > 42 ? `…${body.slice(-42)}` : body;
+};
+
+const formatTime = (ms?: number): string => {
+  if (!ms) return '无';
+  try {
+    const date = new Date(ms);
+    const pad = (n: number) => String(n).padStart(2, '0');
+    return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  } catch {
+    return String(ms);
+  }
+};
+
 const describePosition = (local: string | undefined, remote: string | undefined): string => {
-  if (!local && !remote) return '两端都没有位置';
-  if (!local) return '仅远端有位置';
-  if (!remote) return '仅本地有位置';
+  if (!local && !remote) return '两端都没有阅读位置（这本书还没被读过）';
+  if (!local) return '仅远端有位置（本机打开时会跳到远端）';
+  if (!remote) return '仅本地有位置（可在本机推送上去）';
   if (local === remote) return '两端位置完全一致';
   try {
     const cmp = CFI.compare(local, remote);
-    if (cmp < 0) return '远端更靠后（打开书时应向远端跳转）';
-    if (cmp > 0) return '本地更靠后（防回退保护会保留本地位置）';
+    if (cmp < 0) return '远端更靠后（打开书应向远端跳转）';
+    if (cmp > 0) return '本地更靠后（防回退：不会把本机拉回更前面的位置）';
     return 'CFI 等价';
   } catch {
     return '两端位置不同，CFI 不可比（可能是不同来源的文件）';
@@ -101,6 +126,12 @@ export const verifyWebDavSync = async (
   const settings = useSettingsStore.getState().settings;
   let statisticsBroken = false;
   let mismatchCount = 0;
+
+  items.push({
+    label: '补丁版本',
+    status: 'info',
+    detail: `${CONFIG_SYNC_PATCH_TAG}（两端都应是这个版本，否则一端还是旧包）`,
+  });
 
   // 1) 连接与远端书库索引
   const libraryPath = `${READEST_WEBDAV_BOOKS_DIR}/library.json`;
@@ -167,6 +198,9 @@ export const verifyWebDavSync = async (
                 label,
                 status: 'warn' as VerifyStatus,
                 detail: `远端无 config.json（HTTP ${res.status}）；本地${localConfig?.location ? '有' : '无'}阅读位置`,
+                bookHash: book.hash,
+                canPush: !!localConfig?.location,
+                canPull: false,
               },
             };
           }
@@ -180,18 +214,35 @@ export const verifyWebDavSync = async (
           }
           const localLocation = localConfig?.location;
           const remoteLocation = remoteConfig.location;
-          const same = !!localLocation && !!remoteLocation && localLocation === remoteLocation;
+          // 先比字符串（快路径）；不同再按 CFI 语义比较——两端跳到同一处时，
+          // 序列化形式可能存在无害差异（属性断言、offset 写法），直接比字符串
+          // 会把「其实一致」的书报成不一致，让人误判同步失效。
+          let same = !!localLocation && !!remoteLocation && localLocation === remoteLocation;
+          if (!same && localLocation && remoteLocation) {
+            try {
+              same = CFI.compare(localLocation, remoteLocation) === 0;
+            } catch {
+              same = false;
+            }
+          }
+          const bothEmpty = !localLocation && !remoteLocation;
           const detail = [
             describePosition(localLocation, remoteLocation),
-            `远端 updatedAt ${remoteConfig.updatedAt ?? 0} / 本地 ${localConfig?.updatedAt ?? 0}`,
+            `远端 ${formatTime(remoteConfig.updatedAt)} / 本地 ${formatTime(localConfig?.updatedAt)}`,
+            `位置 本地 ${shortCfi(localLocation)} ↔ 远端 ${shortCfi(remoteLocation)}`,
           ].join('；');
           return {
             book,
-            mismatch: !same,
+            // 两端都没读过不算"不一致"：把这类书计进告警会让报告看起来远比实际
+            // 严重（51 本书里大部分没读过），掩盖真正有问题的那几本。
+            mismatch: !same && !bothEmpty,
             item: {
               label,
-              status: same ? ('ok' as VerifyStatus) : ('warn' as VerifyStatus),
+              status: same ? ('ok' as VerifyStatus) : bothEmpty ? ('info' as VerifyStatus) : ('warn' as VerifyStatus),
               detail,
+              bookHash: book.hash,
+              canPush: !!localLocation,
+              canPull: !!remoteLocation,
             },
           };
         } catch (error) {
@@ -213,7 +264,9 @@ export const verifyWebDavSync = async (
   items.push({
     label: '阅读进度文件',
     status: mismatchCount === 0 ? 'ok' : 'warn',
-    detail: `检查 ${targets.length} 本：${mismatchCount} 本两端位置不同${books.length > targets.length ? `（仅检查前 ${MAX_CHECK_BOOKS} 本）` : ''}`,
+    detail:
+      `检查 ${targets.length} 本：${mismatchCount} 本两端位置不同` +
+      `${books.length > targets.length ? `（仅检查前 ${MAX_CHECK_BOOKS} 本）` : ''}`,
   });
   for (const r of results) {
     if (r.item.status !== 'ok') items.push(r.item);
@@ -278,9 +331,11 @@ export const verifyWebDavSync = async (
   const warns = items.filter((i) => i.status === 'warn').length;
   const summary = errors > 0
     ? `发现 ${errors} 项错误${statisticsBroken ? '（含统计文件损坏）' : ''}，建议按下方明细处理`
-    : warns > 0
-      ? `基本可用，有 ${warns} 项提示（多为尚未上传或两端进度不同，同步后会收敛）`
-      : '全部检查通过：连接、进度文件与阅读统计均一致';
+    : mismatchCount > 0
+      ? `连接正常；${mismatchCount} 本两端进度不同（明细里可对单本书强制拉取或推送）`
+      : warns > 0
+        ? `连接正常，仍有 ${warns} 项提示（见下方明细）`
+        : '全部检查通过：连接、进度文件与阅读统计均一致';
 
   return {
     checkedAt: Date.now(),

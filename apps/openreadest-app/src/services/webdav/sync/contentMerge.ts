@@ -1,3 +1,5 @@
+import { CFI } from '@/libs/document';
+
 import { DEVICE_LOCAL_BOOK_FIELDS } from './deviceFields';
 
 type JsonRecord = Record<string, unknown>;
@@ -140,6 +142,49 @@ const withoutBooknotes = (config: JsonRecord): JsonRecord => {
   return rest;
 };
 
+/**
+ * 合并「阅读进度」字段（location / progress / xpointer），不改动其它配置。
+ *
+ * 两个必须在这里保证的不变式：
+ *
+ * 1. **一端缺失就取另一端。** 跨设备最常见形态是：一端读过（有 location），另一端
+ *    从未读过（config 只有 `updatedAt: 0`）。按 updatedAt 取 winner 时，没读过的
+ *    那端只要发生过一次自动落盘就会被判「更新」而胜出，位置随之丢失；合并结果再
+ *    上传，云端进度就被洗成空——「同步一次，进度反而没了」。
+ * 2. **位置只进不退。** 阅读位置是单调累积的事实，不该参与「谁 updatedAt 更新」的
+ *    竞争。两端都有位置时取更靠后的那一端，避免旧设备把进度整体拉回前面。
+ *    需要「以本机为准强行回退」时走 pushBookConfig 的 force 分支（它直接覆盖
+ *    location，不经过这里）。
+ */
+const mergeProgressFields = (merged: JsonRecord, local: JsonRecord, remote: JsonRecord) => {
+  const localLocation = local['location'];
+  const remoteLocation = remote['location'];
+  const localValid = typeof localLocation === 'string' && !!localLocation;
+  const remoteValid = typeof remoteLocation === 'string' && !!remoteLocation;
+
+  let source: JsonRecord | null = null;
+  if (localValid && remoteValid) {
+    let localAhead = true;
+    try {
+      localAhead = CFI.compare(localLocation, remoteLocation) >= 0;
+    } catch {
+      // CFI 不可比（格式差异）：按本地为准，至少不会把本机进度丢给一段无法解析的字符串
+      localAhead = true;
+    }
+    source = localAhead ? local : remote;
+  } else if (localValid) {
+    source = local;
+  } else if (remoteValid) {
+    source = remote;
+  }
+
+  if (!source) return;
+  merged['location'] = source['location'];
+  if (source['progress'] !== undefined) merged['progress'] = source['progress'];
+  const xpointer = source['xpointer'];
+  if (typeof xpointer === 'string' && !!xpointer) merged['xpointer'] = xpointer;
+};
+
 const mergeBookConfig = (local: unknown, remote: unknown): JsonRecord | null => {
   if (!isJsonRecord(local) || !isJsonRecord(remote)) return null;
   if (!hasValidOptionalId(local, 'bookHash') || !hasValidOptionalId(remote, 'bookHash')) {
@@ -173,6 +218,7 @@ const mergeBookConfig = (local: unknown, remote: unknown): JsonRecord | null => 
         if (fallback) merged[identityKey] = fallback;
       }
     }
+    mergeProgressFields(merged, local, remote);
     merged['booknotes'] = [];
     return merged;
   }
@@ -188,6 +234,7 @@ const mergeBookConfig = (local: unknown, remote: unknown): JsonRecord | null => 
     }
   }
 
+  mergeProgressFields(merged, local, remote);
   merged['booknotes'] = mergeRecordMaps(localNotes, remoteNotes, ['updatedAt', 'deletedAt']);
   return merged;
 };

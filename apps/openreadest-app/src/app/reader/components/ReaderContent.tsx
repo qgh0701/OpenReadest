@@ -22,6 +22,7 @@ import { eventDispatcher } from '@/utils/event';
 import { navigateToLibrary } from '@/utils/nav';
 import { clearDiscordPresence } from '@/utils/discord';
 import { BOOK_IDS_SEPARATOR } from '@/services/constants';
+import { shouldKeepRemoteLocation } from '@/services/webdav/sync/applyRemoteConfigs';
 import { BookDetailModal } from '@/components/metadata';
 
 import useBooksManager from '../hooks/useBooksManager';
@@ -129,6 +130,21 @@ const ReaderContent: React.FC<{ ids?: string; settings: SystemSettings }> = ({ i
     const { isPrimary } = getViewState(bookKey) || {};
     if (isPrimary && book && config) {
       const settings = useSettingsStore.getState().settings;
+      // 阅读位置只存在 readerStore 的 progress 里——本分支原本没有任何代码把
+      // 它写进 config.location，磁盘上的 config.json 因此长期只有
+      // `{updatedAt: 0}`，跨设备进度同步拿不到位置。关书前先补齐，
+      // 再派发同步事件，让推送与自动保存都用真实位置。
+      const progress = useReaderStore.getState().getProgress(bookKey);
+      // WebDAV 刚把远端进度写进 config、视图还没跳到位时，progress 还停在旧位置。
+      // 此时写入会把远端位置覆盖掉，导致「每次开书都得重新联网拉一次才跳」。
+      if (progress?.location && !shouldKeepRemoteLocation(bookKey, progress.location)) {
+        config.location = progress.location;
+        const current = progress.pageinfo?.current;
+        const total = progress.pageinfo?.total;
+        if (typeof current === 'number' && typeof total === 'number') {
+          config.progress = [current, total];
+        }
+      }
       eventDispatcher.dispatch('sync-book-progress', { bookKey });
       eventDispatcher.dispatch('flush-kosync', { bookKey });
       await saveConfig(envConfig, bookKey, config, settings);

@@ -138,5 +138,17 @@
   "未解析出有效词条：{{names}}": "No valid entries found: {{names}}",
   "导入后在「翻译服务」里选择「本地词典（离线）」即可断网使用。": "After importing, choose 'Local Dictionaries (Offline)' in Translation Service to use it without network.",
   "Select Wordlist Files": "Select Wordlist Files",
-  "本地词典（离线）": "Local Dictionaries (Offline)"
+  "本地词典（离线）": "Local Dictionaries (Offline)",
+  "已用云端进度覆盖本机并跳转": "Applied cloud progress and jumped to it",
+  "拉取失败：云端没有这本书的进度": "Pull failed: no progress for this book in the cloud",
+  "已用云端进度覆盖本机": "Cloud progress applied to this device",
+  "拉取失败：": "Pull failed: ",
+  "本机没有这本书的阅读位置": "No reading position for this book on this device",
+  "已把本机进度推送到云端": "Progress from this device pushed to the cloud",
+  "推送失败：": "Push failed: ",
+  "操作失败：": "Operation failed: ",
+  "拉取中…": "Pulling…",
+  "推送中…": "Pushing…",
+  "← 用云端覆盖本机": "← Overwrite with cloud",
+  "把本机进度推上云端 →": "Push local progress →"
 }

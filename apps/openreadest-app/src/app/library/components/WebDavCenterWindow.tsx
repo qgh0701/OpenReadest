@@ -17,6 +17,7 @@ import {
 import { useEnv } from '@/context/EnvContext';
 import { useTranslation } from '@/hooks/useTranslation';
 import { useLibraryStore } from '@/store/libraryStore';
+import { useReaderStore } from '@/store/readerStore';
 import { useWebDavStore, loadWebDavStoreFromStorage } from '@/store/webdavStore';
 import { useSettingsStore } from '@/store/settingsStore';
 import { isReadingStatsEnabled } from '@/services/statistics/remainingTime';
@@ -52,6 +53,11 @@ import {
 import { Book, BookFormat } from '@/types/book';
 import { EXTS } from '@/libs/document';
 import { verifyWebDavSync, VerifyReport } from '@/services/webdav/sync/verify';
+import {
+  pullBookConfigToDisk,
+  pullRemoteBookProgress,
+  pushBookConfig,
+} from '@/services/webdav/sync/applyRemoteConfigs';
 import { repairRemoteStatistics, STATISTICS_SYNC_KEY } from '@/services/statistics/statisticsSync';
 import { StatisticsDb } from '@/services/statistics/statisticsDb';
 
@@ -151,6 +157,8 @@ export const WebDavCenterWindow = () => {
   const [isRepairing, setIsRepairing] = useState(false);
   const [verifyReport, setVerifyReport] = useState<VerifyReport | null>(null);
   const [showVerifyDetails, setShowVerifyDetails] = useState(true);
+  // 验证明细里针对单本书的强制拉取 / 推送正在进行（`<hash>:pull` 形式）
+  const [busyBookAction, setBusyBookAction] = useState<string | null>(null);
 
   useEffect(() => {
     const handleCustomEvent = (event: CustomEvent) => {
@@ -775,6 +783,60 @@ export const WebDavCenterWindow = () => {
       showToast(_('同步验证失败：') + ((error as Error).message || ''), 'error');
     } finally {
       setIsVerifying(false);
+    }
+  };
+
+  /**
+   * 验证明细里的单本书操作：
+   * - pull：用云端进度覆盖本机（force，忽略防回退），书正打开时同时跳页
+   * - push：把本机进度直接 PUT 到云端（force）
+   * 两条路径都绕开同步引擎，因此结果是确定的，不会出现「点完什么都没发生」。
+   */
+  const runBookConfigAction = async (hash: string, action: 'pull' | 'push') => {
+    if (!appService || busyBookAction) return;
+    const book = useLibraryStore.getState().library.find((b) => b.hash === hash);
+    if (!book) return;
+    const marker = `${hash}:${action}`;
+    setBusyBookAction(marker);
+    try {
+      if (action === 'pull') {
+        const openKey = useReaderStore.getState().bookKeys.find((k) => k.split('-')[0] === hash);
+        if (openKey) {
+          const ok = await pullRemoteBookProgress(
+            appService,
+            openKey,
+            _('Reading Progress Synced'),
+            { force: true },
+          );
+          showToast(
+            ok ? _('已用云端进度覆盖本机并跳转') : _('拉取失败：云端没有这本书的进度'),
+            ok ? 'success' : 'error',
+          );
+        } else {
+          const res = await pullBookConfigToDisk(appService, book, { force: true });
+          showToast(
+            res.ok ? _('已用云端进度覆盖本机') : _('拉取失败：') + res.reason,
+            res.ok ? 'success' : 'error',
+          );
+        }
+      } else {
+        const settings = useSettingsStore.getState().settings;
+        const config = await appService.loadBookConfig(book, settings);
+        if (!config?.location) {
+          showToast(_('本机没有这本书的阅读位置'), 'warning');
+        } else {
+          const res = await pushBookConfig(book, config, { force: true });
+          showToast(
+            res.ok ? _('已把本机进度推送到云端') : _('推送失败：') + res.reason,
+            res.ok ? 'success' : 'error',
+          );
+        }
+      }
+      await runVerify();
+    } catch (error) {
+      showToast(_('操作失败：') + ((error as Error).message || ''), 'error');
+    } finally {
+      setBusyBookAction(null);
     }
   };
 
@@ -1661,9 +1723,37 @@ export const WebDavCenterWindow = () => {
                         >
                           ●
                         </span>
-                        <span>
-                          <strong>{item.label}</strong>：{item.detail}
-                        </span>
+                        <div className='min-w-0 flex-1'>
+                          <div>
+                            <strong>{item.label}</strong>：{item.detail}
+                          </div>
+                          {item.bookHash && (item.canPull || item.canPush) && (
+                            <div className='mt-1 flex flex-wrap gap-1'>
+                              {item.canPull && (
+                                <button
+                                  className='btn btn-ghost btn-xs'
+                                  disabled={!!busyBookAction}
+                                  onClick={() => void runBookConfigAction(item.bookHash!, 'pull')}
+                                >
+                                  {busyBookAction === `${item.bookHash}:pull`
+                                    ? _('拉取中…')
+                                    : _('← 用云端覆盖本机')}
+                                </button>
+                              )}
+                              {item.canPush && (
+                                <button
+                                  className='btn btn-ghost btn-xs'
+                                  disabled={!!busyBookAction}
+                                  onClick={() => void runBookConfigAction(item.bookHash!, 'push')}
+                                >
+                                  {busyBookAction === `${item.bookHash}:push`
+                                    ? _('推送中…')
+                                    : _('把本机进度推上云端 →')}
+                                </button>
+                              )}
+                            </div>
+                          )}
+                        </div>
                       </li>
                     ))}
                   </ul>

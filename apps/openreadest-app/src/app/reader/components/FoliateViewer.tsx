@@ -388,7 +388,11 @@ const FoliateViewer: React.FC<{
       }
       applyMarginAndGap();
 
-      const lastLocation = config.location;
+      // 注意：这里的 config 是组件首次渲染时闭包捕获的快照。WebDAV 的开书定向
+      // 拉取是并发进行的，如果它先一步把远端进度写进了 store，init 仍按这份旧
+      // 快照定位，刚拉到的进度会当场被覆盖回旧位置（表现为「打开不跳、关掉再开
+      // 才跳」）。因此以 store 里的实时 config 为准，旧快照只作兜底。
+      const lastLocation = getBookData(bookKey)?.config?.location ?? config.location;
       if (lastLocation) {
         await view.init({ lastLocation });
       } else {
